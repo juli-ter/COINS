@@ -1,0 +1,1 @@
+from coins_py.subject_analysis import coins_analyse_subject_behaviour
