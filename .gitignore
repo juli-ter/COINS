@@ -1,0 +1,18 @@
+# игнорировать вообще всё
+*
+
+# но не игнорировать папки
+!*/
+
+# разрешить только Python-файлы
+!*.py
+!*.md
+!*.txt
+
+# разрешить сам .gitignore
+!.gitignore
+
+# virtual environment
+.venv/
+venv/
+env/
