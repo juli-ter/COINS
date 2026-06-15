@@ -37,13 +37,14 @@ def load_subject_data(sub_id: int, options) -> pd.DataFrame | None:
     data = remove_excluded_blocks(data, details["excludedBlocks"])
     data["subject"] = details["subjName"]
 
-    required = {"subject", "sessID", "blockID", "currentFrame", "trueVariance", "shieldDegrees"}
+    required = {"subject", "sessID", "blockID", "currentFrame", "trueVariance", "shieldDegrees", "volatility"}
     missing = required.difference(data.columns)
 
     if missing:
         print(f"[sub-{sub_id:02d}] skipped: missing columns {sorted(missing)}")
         return None
-
+    data["subject"] = details["subjName"]
+    data["volatility_label"] = data["volatility"].map({0: "Stable", 1: "Volatile"})
     return data.reset_index(drop=True)
 
 
@@ -90,13 +91,16 @@ def extract_curves_for_block(
         else:
             continue
 
+        shield_at_cp = float(shield[cp_idx])
+
         for rel_frame in range(-pre_frames, post_frames + 1):
             target_frame = cp_frame + rel_frame
-
             nearest_idx = np.argmin(np.abs(frames - target_frame))
 
             if abs(frames[nearest_idx] - target_frame) > 1:
                 continue
+
+            shield_value = float(shield[nearest_idx])
 
             rows.append(
                 {
@@ -110,14 +114,14 @@ def extract_curves_for_block(
                     "direction": direction,
                     "relative_frame": int(rel_frame),
                     "relative_sec": rel_frame / float(fsample),
-                    "shieldDegrees": float(shield[nearest_idx]),
-                    "baseline_shield": float(shield[cp_idx]),
-                    "shield_change_from_cp": float(shield[nearest_idx] - shield[cp_idx]),
+                    "shieldDegrees": shield_value,
+                    "shield_at_cp": shield_at_cp,
+                    "shield_change_from_cp": shield_value - shield_at_cp,
+                    "volatility_label": block_data["volatility_label"].iloc[0],
                 }
             )
 
     return rows
-
 
 def extract_all_curves(
     all_data: pd.DataFrame,
@@ -146,21 +150,21 @@ def summarize_curves(curves: pd.DataFrame) -> pd.DataFrame:
 
     subject_curves = (
         curves.groupby(
-            ["subject", "noise_transition", "direction", "relative_sec"],
+            ["subject", "volatility_label", "noise_transition", "direction", "relative_sec"],
             observed=True,
-        )["shieldDegrees"]
+        )["shield_change_from_cp"]
         .mean()
         .reset_index()
     )
 
     summary = (
         subject_curves.groupby(
-            ["noise_transition", "direction", "relative_sec"],
+            ["volatility_label", "noise_transition", "direction", "relative_sec"],
             observed=True,
-        )["shieldDegrees"]
+        )["shield_change_from_cp"]
         .agg(
-            mean_shield_degrees="mean",
-            sem_shield_degrees=lambda x: x.std(ddof=1) / np.sqrt(len(x)) if len(x) > 1 else np.nan,
+            mean_shield_change="mean",
+            sem_shield_change=lambda x: x.std(ddof=1) / np.sqrt(len(x)) if len(x) > 1 else np.nan,
             n_subjects="count",
         )
         .reset_index()
@@ -176,7 +180,21 @@ def plot_curves(summary: pd.DataFrame, output_path: Path) -> None:
     transitions_increase = ["10->20", "20->30", "10->30"]
     transitions_decrease = ["30->20", "20->10", "30->10"]
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5), sharey=True)
+    transition_colors = {
+        "10->20": "tab:blue",
+        "20->30": "tab:orange",
+        "10->30": "tab:green",
+        "30->20": "tab:blue",
+        "20->10": "tab:orange",
+        "30->10": "tab:green",
+    }
+
+    volatility_styles = {
+        "Stable": "-",
+        "Volatile": "--",
+    }
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5.8), sharey=True)
 
     for ax, transitions, title in zip(
         axes,
@@ -184,33 +202,54 @@ def plot_curves(summary: pd.DataFrame, output_path: Path) -> None:
         ["Noise increase", "Noise decrease"],
     ):
         for transition in transitions:
-            current = summary[summary["noise_transition"] == transition].copy()
+            for volatility_label in ["Stable", "Volatile"]:
+                current = summary[
+                    (summary["noise_transition"] == transition)
+                    & (summary["volatility_label"] == volatility_label)
+                ].copy()
 
-            if current.empty:
-                continue
+                if current.empty:
+                    continue
 
-            current = current.sort_values("relative_sec")
+                current = current.sort_values("relative_sec")
 
-            x = current["relative_sec"].to_numpy(dtype=float)
-            y = current["mean_shield_degrees"].to_numpy(dtype=float)
-            sem = current["sem_shield_degrees"].to_numpy(dtype=float)
+                x = current["relative_sec"].to_numpy(dtype=float)
+                y = current["mean_shield_change"].to_numpy(dtype=float)
+                sem = current["sem_shield_change"].to_numpy(dtype=float)
 
-            ax.plot(x, y, linewidth=2.0, label=transition)
-            ax.fill_between(x, y - sem, y + sem, alpha=0.18)
+                ax.plot(
+                    x,
+                    y,
+                    linewidth=2.0,
+                    linestyle=volatility_styles[volatility_label],
+                    color=transition_colors[transition],
+                    label=f"{transition} {volatility_label}",
+                )
+
+                ax.fill_between(
+                    x,
+                    y - sem,
+                    y + sem,
+                    color=transition_colors[transition],
+                    alpha=0.10,
+                )
 
         ax.axvline(0, color="black", linewidth=1.2, linestyle="--")
+        ax.axhline(0, color="black", linewidth=1.0)
         ax.set_title(title)
         ax.set_xlabel("Time from noise changepoint (s)")
-        ax.set_ylabel("Mean shield size (degrees)")
-        ax.set_ylim(15, 65)
-        ax.set_yticks([20, 40, 60])
+        ax.set_ylabel("Δ shield size from changepoint (degrees)")
         ax.grid(alpha=0.25)
-        ax.legend(title="Transition")
+        ax.legend(title="Transition / block type", fontsize=8)
 
-    fig.suptitle("Shield size adaptation around noise changepoints", fontsize=14)
+    fig.suptitle(
+        "Normalized shield size adaptation around noise changepoints",
+        fontsize=14,
+    )
     fig.tight_layout()
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
+
 
 
 def main() -> None:
@@ -253,9 +292,9 @@ def main() -> None:
 
     suffix = f"pre_{args.pre_sec:g}s_post_{args.post_sec:g}s"
 
-    curves_path = output_dir / f"noise_changepoint_shield_curves_long_{suffix}.csv"
-    summary_path = output_dir / f"noise_changepoint_shield_curves_summary_{suffix}.csv"
-    figure_path = output_dir / f"noise_changepoint_shield_curves_{suffix}.png"
+    curves_path = output_dir / f"noise_changepoint_shield_curves_normalized_by_volatility_long_{suffix}.csv"
+    summary_path = output_dir / f"noise_changepoint_shield_curves_normalized_by_volatility_summary_{suffix}.csv"
+    figure_path = output_dir / f"noise_changepoint_shield_curves_normalized_by_volatility_{suffix}.png"
 
     curves.to_csv(curves_path, index=False)
     summary.to_csv(summary_path, index=False)
